@@ -55,4 +55,8 @@ void down(const Experts& e, const float* h, const int32_t* idx, int T, int n_use
 void combine(uint16_t* resid, const float* y, const float* wgt, const float* sgate, int ld, const float* shared, int T, int n_used,
              int hidden, void* stream);
 
+/// combine with y as FP16 (rows rounded to FP16 by the prompt path's down product).
+void combine_f16(uint16_t* resid, const uint16_t* y, const float* wgt, const float* sgate, int ld, const float* shared, int T,
+                 int n_used, int hidden, void* stream);
+
 }  // namespace basalt::kernels::moe

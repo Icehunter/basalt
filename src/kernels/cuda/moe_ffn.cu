@@ -9,6 +9,7 @@
 #include "basalt/log.hpp"
 
 #include <cuda_bf16.h>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <cstdlib>
@@ -273,13 +274,17 @@ __global__ void __launch_bounds__(256) router_kernel(const float* __restrict__ x
     }
 }
 
-__global__ void combine_kernel(uint16_t* __restrict__ resid, const float* __restrict__ y, const float* __restrict__ wgt,
+__device__ __forceinline__ float load_y(const float* y, size_t i) { return y[i]; }
+__device__ __forceinline__ float load_y(const __half* y, size_t i) { return __half2float(y[i]); }
+
+template <typename Y>
+__global__ void combine_kernel(uint16_t* __restrict__ resid, const Y* __restrict__ y, const float* __restrict__ wgt,
                                const float* __restrict__ sgate, int ld, const float* __restrict__ shared, int n_used, int hidden) {
     const int t = blockIdx.x;
     const float sg = 1.0f / (1.0f + __expf(-sgate[(size_t) t * ld]));
     for (int c = threadIdx.x; c < hidden; c += blockDim.x) {
         float routed = 0.0f;
-        for (int k = 0; k < n_used; ++k) routed += wgt[(size_t) t * n_used + k] * y[((size_t) t * n_used + k) * hidden + c];
+        for (int k = 0; k < n_used; ++k) routed += wgt[(size_t) t * n_used + k] * load_y(y, ((size_t) t * n_used + k) * hidden + c);
         const size_t at = (size_t) t * hidden + c;
         const float r = __uint_as_float((uint32_t) resid[at] << 16);
         resid[at] = __bfloat16_as_ushort(__float2bfloat16_rn((r + routed) + sg * shared[at]));
@@ -358,7 +363,14 @@ void down(const Experts& e, const float* h, const int32_t* idx, int T, int n_use
 void combine(uint16_t* resid, const float* y, const float* wgt, const float* sgate, int ld, const float* shared, int T, int n_used,
              int hidden, void* stream) {
     if (T <= 0) return;
-    combine_kernel<<<T, 256, 0, (cudaStream_t) stream>>>(resid, y, wgt, sgate, ld, shared, n_used, hidden);
+    combine_kernel<float><<<T, 256, 0, (cudaStream_t) stream>>>(resid, y, wgt, sgate, ld, shared, n_used, hidden);
+    check("moe combine");
+}
+
+void combine_f16(uint16_t* resid, const uint16_t* y, const float* wgt, const float* sgate, int ld, const float* shared, int T,
+                 int n_used, int hidden, void* stream) {
+    if (T <= 0) return;
+    combine_kernel<__half><<<T, 256, 0, (cudaStream_t) stream>>>(resid, reinterpret_cast<const __half*>(y), wgt, sgate, ld, shared, n_used, hidden);
     check("moe combine");
 }
 
