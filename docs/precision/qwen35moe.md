@@ -46,6 +46,13 @@ against 0.01303 and 94.63% with two terms, int8 KV).
 
 The gate reads 256 tokens of each chunk as a prompt. Long prompts are scored in the next section.
 
+## Drafting
+
+The MTP layer's drafts are proposals the model checks: a draft is kept only when it equals the model's own pick, so drafting
+cannot change the output. With several slots drafting, a round's drafts run as one pass of one row per session, and each
+session's drafts and their chances are the same bits as drafted alone (`qwen35_drafter_batch_test`). The 100-chunk gate runs
+with drafting on and gives the same numbers with the batched and with the single-session drafter.
+
 ## Quality
 
 The reference is the BF16 GGUF of the same model through `llama-perplexity` (llama.cpp `b1b770d90`), wikitext-2, 100 chunks of
