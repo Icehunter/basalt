@@ -75,7 +75,7 @@ struct Product {
     size_t tail_off = 0;
     /// A layer's experts in one launch (any n): expert j's blob at base + j * stride (blob[] unused), its GEMM blocks
     /// from blk_off (plan_blocks; the grid covers `blocks`, max_blocks()); output row r goes to dst row dst_ids[r]
-    /// (null: r); the SwiGLU, with gate_softcap > 0, is mmq::swiglu's softcapped form.
+    /// (null: r); the SwiGLU, with gate_softcap > 0, is mmq::swiglu's softcapped form (0: the plain tail-scaled SwiGLU).
     const uint8_t* base = nullptr;
     size_t stride = 0;
     const int32_t* blk_off = nullptr;

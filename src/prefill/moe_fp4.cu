@@ -379,8 +379,12 @@ template <bool SWIGLU> __device__ __forceinline__ int b_tile_row(int warp_n, int
 
 // mmq::swiglu's tail-scaled SwiGLU in the instructions of its fast-math build (FTZ products, ex2 and rcp
 // approximations, the division as a reciprocal product), so h is the same bits
-// mmq::swiglu's softcapped form: (cg tanh(g / cg)) sigmoid(g) (cu tanh(u / cu)) s_down, g and u tail-scaled
+__device__ __forceinline__ float swiglu_tail(float g, float u, float4 s);
+
+// mmq::swiglu's softcapped form: (cg tanh(g / cg)) sigmoid(g) (cu tanh(u / cu)) s_down, g and u tail-scaled; no softcap
+// (cg 0): the plain tail-scaled SwiGLU
 __device__ __forceinline__ float swiglu_cap(float g, float u, float4 s, float cg, float cu, float inv_cg, float inv_cu) {
+    if (!(cg > 0.0f)) return swiglu_tail(g, u, s);
     g *= s.x;
     u *= s.y;
     float tg, tu, t, e, d, sig;
@@ -890,6 +894,7 @@ void quantize_f16(const uint16_t* x, const int32_t* bounds, const int32_t* tile_
     const unsigned grid = (unsigned) ((rows + 7) / 8);
     const cudaStream_t s = (cudaStream_t) stream;
     if (cols == 1152) quantize_f16_kernel<3><<<grid, 256, 0, s>>>(x, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
+    else if (cols == 512) quantize_f16_kernel<1><<<grid, 256, 0, s>>>(x, bounds, tile_off, n, (uint8_t*) a4, gs, (int) cols, ld, rows);
     else { basalt::log::error("basalt", "prefill fp4: %lld fp16 columns", (long long) cols); std::exit(1); }
     ck(cudaGetLastError(), "quantize_f16");
 }
@@ -903,6 +908,7 @@ void quantize_tokens(const float* x, int64_t tokens, int64_t cols, int64_t ld, v
     const cudaStream_t s = (cudaStream_t) stream;
     if (two) {
         if (cols == 2304) quantize_kernel<5, true, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
+        else if (cols == 2048) quantize_kernel<4, true, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
         else { basalt::log::error("basalt", "prefill fp4: %lld token columns (two terms)", (long long) cols); std::exit(1); }
     } else if (cols == 2560) quantize_kernel<5, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
     else if (cols == 640) quantize_kernel<2, true><<<grid, 256, 0, s>>>(x, nullptr, nullptr, nullptr, 0, (uint8_t*) a4, gs, (int) cols, ld, tokens);
@@ -947,8 +953,8 @@ template <bool GATHER, bool SWIGLU> void launch256(const GemmArgs& a, dim3 grid,
 void run(const Product& p, void* stream) {
     if (p.base) {   // a layer's experts in one launch
         if (p.n <= 0 || p.blocks <= 0) return;
-        if ((p.ids != nullptr) != p.swiglu || !p.blk_off || p.gate_softcap <= 0.0f) {
-            basalt::log::error("basalt", "prefill fp4: a layer's experts need blk_off, softcaps, and token rows with the SwiGLU");
+        if ((p.ids != nullptr) != p.swiglu || !p.blk_off) {
+            basalt::log::error("basalt", "prefill fp4: a layer's experts need blk_off and token rows with the SwiGLU");
             std::exit(1);
         }
         GemmArgs a{};
