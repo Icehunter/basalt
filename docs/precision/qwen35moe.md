@@ -48,10 +48,9 @@ The gate reads 256 tokens of each chunk as a prompt. Long prompts are scored in 
 
 ## Drafting
 
-The MTP layer's drafts are proposals the model checks: a draft is kept only when it equals the model's own pick, so drafting
-cannot change the output. With several slots drafting, a round's drafts run as one pass of one row per session, and each
-session's drafts and their chances are the same bits as drafted alone (`qwen35_drafter_batch_test`). The 100-chunk gate runs
-with drafting on and gives the same numbers with the batched and with the single-session drafter.
+The MTP layer's drafts are proposals. A draft is kept only when it equals the model's own pick, so drafting cannot change the
+output. When several slots draft, a round's drafts run as one pass with one row per session. Each session gets the same drafts
+and chances, to the bit, as when it drafts alone (`qwen35_drafter_batch_test`). The quality gate runs with drafting on.
 
 ## Quality
 
