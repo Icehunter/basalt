@@ -273,6 +273,51 @@ public:
         return {};
     }
 
+    // The MTP chains of `count` sessions on `s`, step k of every session that still drafts as one pass of rows.
+    Result draft_chains(Session* const* ss, const int32_t* anchors, const int64_t* pos, const int* n, int count, cudaStream_t s) {
+        std::vector<int> nn((size_t) count);
+        int deepest = 0;
+        for (int i = 0; i < count; ++i) {
+            Session& x = *ss[i];
+            if (x.st_.tail_cell != pos[i] - 1)
+                return fail(m_.o.arch + ": the drafter has no row before position " + std::to_string((long long) pos[i]));
+            int d = std::clamp(n[i], 1, max_window() - 1);
+            if (pos[i] + d > m_.o.max_context) d = (int) std::max<int64_t>(1, m_.o.max_context - pos[i]);
+            nn[(size_t) i] = d;
+            deepest = std::max(deepest, d);
+            cudaMemcpyAsync(x.st_.win_tok, &anchors[i], sizeof(int32_t), cudaMemcpyHostToDevice, s);
+        }
+        const int H = g_.n_embd;
+        std::string err;
+        std::vector<SessionState*> sts;
+        std::vector<const float*> hid;
+        std::vector<const int32_t*> tok;
+        std::vector<int64_t> c0;
+        std::vector<float*> out, lpr;
+        for (int k = 0; k < deepest; ++k) {
+            sts.clear(), hid.clear(), tok.clear(), c0.clear(), out.clear(), lpr.clear();
+            for (int i = 0; i < count; ++i) {
+                if (nn[(size_t) i] <= k) continue;
+                SessionState& st = ss[i]->st_;
+                sts.push_back(&st);
+                hid.push_back(k == 0 ? st.tail : st.chain + (size_t) ((k - 1) & 1) * H);
+                tok.push_back(k == 0 ? st.win_tok : reinterpret_cast<const int32_t*>(st.lp + (size_t) (k - 1) * kernels::kLogprobStride + 2));
+                c0.push_back(pos[i] - 1 + k);
+                out.push_back(st.chain + (size_t) (k & 1) * H);
+                lpr.push_back(st.lp + (size_t) k * kernels::kLogprobStride);
+            }
+            const bool ok = sts.size() == 1 ? mtp_step(m_, *sts[0], k, hid[0], tok[0], c0[0], out[0], lpr[0], err, s)
+                                            : mtp_step_batch(m_, sts.data(), hid.data(), tok.data(), c0.data(), (int) sts.size(),
+                                                             out.data(), lpr.data(), err, s);
+            if (!ok) return fail(err);
+        }
+        for (int i = 0; i < count; ++i) {
+            ss[i]->st_.tail_cell = -1;
+            ss[i]->n_draft_ = nn[(size_t) i];
+        }
+        return {};
+    }
+
     // Several sessions' MTP chains back to back on the first one's stream (they share the model's window scratch): each other
     // session's stream hands over what its chain reads, and waits for the chains before its draft_end reads its own.
     Result draft_batch_mtp(model::ModelSession* const* peers, const int32_t* anchors, const int64_t* pos, const int* n, int count) {
@@ -288,13 +333,47 @@ public:
         // each session's settle (the drafter's history through the shared scratch) starts after the previous one's
         for (int i = 0; i < count; ++i) {
             if (i > 0) cudaStreamWaitEvent(ss[(size_t) i]->st_.stream, ss[(size_t) i - 1]->done_, 0);
-            if (Result r = ss[(size_t) i]->settle(pos[i]); !r.ok()) return r;
+            ss[(size_t) i]->hist_n_ = 0;
+            if (Result r = ss[(size_t) i]->settle(pos[i], false, true); !r.ok()) return r;
             cudaEventRecord(ss[(size_t) i]->done_, ss[(size_t) i]->st_.stream);
         }
         const cudaStream_t s0 = ss[0]->st_.stream;
         cudaStreamWaitEvent(s0, ss[(size_t) count - 1]->done_, 0);
-        for (int i = 0; i < count; ++i)
-            if (Result r = ss[(size_t) i]->draft_chain(anchors[i], pos[i], n[i], s0); !r.ok()) return r;
+        // the sessions' drafter histories (the waiting row, then the kept rows) as passes of at most a batch window's rows
+        {
+            std::vector<MtpHist> segs;
+            std::vector<Session*> owner;
+            int rows = 0;
+            std::string err;
+            const auto flush = [&]() {
+                if (segs.empty()) return true;
+                const bool ok = mtp_hist_batch(m_, segs.data(), (int) segs.size(), err, s0);
+                segs.clear();
+                rows = 0;
+                return ok;
+            };
+            for (int i = 0; i < count; ++i) {
+                Session& x = *ss[(size_t) i];
+                if (x.hist_n_ <= 0) continue;
+                const int r = (x.hist_tail_ ? 1 : 0) + (x.hist_n_ > 1 ? x.hist_n_ - 1 : 0);
+                if (rows + r > kBatch || (int) segs.size() + 2 > kBatch) {
+                    if (!flush()) return fail(err);
+                }
+                if (x.hist_tail_) segs.push_back({&x.st_, x.st_.tail, x.st_.win_tok, 1, x.hist_pos_ - 1});
+                if (x.hist_n_ > 1) segs.push_back({&x.st_, x.st_.hid, x.st_.win_tok + 1, x.hist_n_ - 1, x.hist_pos_});
+                rows += r;
+            }
+            if (!flush()) return fail(err);
+            for (int i = 0; i < count; ++i) {
+                Session& x = *ss[(size_t) i];
+                if (x.hist_n_ <= 0) continue;
+                cudaMemcpyAsync(x.st_.tail, x.st_.hid + (size_t) (x.hist_n_ - 1) * g_.n_embd, (size_t) g_.n_embd * sizeof(float),
+                                cudaMemcpyDeviceToDevice, s0);
+                x.st_.tail_cell = x.hist_pos_ + x.hist_n_ - 1;
+                x.hist_n_ = 0;
+            }
+        }
+        if (Result r = draft_chains(ss.data(), anchors, pos, n, count, s0); !r.ok()) return r;
         cudaEventRecord(ss[0]->done_, s0);
         for (int i = 1; i < count; ++i) cudaStreamWaitEvent(ss[(size_t) i]->st_.stream, ss[0]->done_, 0);
         return {};
@@ -796,7 +875,9 @@ private:
         commit_pending_ = false;
     }
     // `defer`: the commit's join is left to the caller (join_commit), which queues work beside it first
-    Result settle(int64_t pos, bool defer = false) {
+    // `hist`: the drafter's history of the window is left pending (hist_*), for draft_batch_mtp to run for several sessions
+    // in one pass
+    Result settle(int64_t pos, bool defer = false, bool hist = false) {
         if (pos == 0) {   // a new conversation: the running state starts empty
             pend_T_ = 0;
             st_.rope_delta = 0;
@@ -854,6 +935,12 @@ private:
         }
         if (drafter_ && n > 0) {
             // the drafter's history: the waiting row with the window's first token, then each kept row with the next
+            if (hist) {
+                hist_n_ = (int) n;
+                hist_pos_ = pend_pos_;
+                hist_tail_ = st_.tail_cell == pend_pos_ - 1;
+                return {};
+            }
             std::string err;
             if (st_.tail_cell == pend_pos_ - 1 && !mtp_window(m_, st_, st_.tail, st_.win_tok, 1, pend_pos_ - 1, nullptr, nullptr, err))
                 return fail(err);
@@ -864,6 +951,10 @@ private:
         }
         return {};
     }
+
+    int hist_n_ = 0;          // a deferred history: the kept rows, the window's first cell, and whether a waiting row comes first
+    int64_t hist_pos_ = 0;
+    bool hist_tail_ = false;
 
     bool device_bias(float*& dev, const float* host, std::string& err) {
         const size_t bytes = (size_t) g_.n_vocab * sizeof(float);
