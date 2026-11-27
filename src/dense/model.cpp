@@ -6,6 +6,7 @@
 #include "basalt/kernels/gqa_attn.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/nvfp4_planes.hpp"
+#include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/prefill/fp4_dense.hpp"
 #include "basalt/prefill/fp8_gemm.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
@@ -527,10 +528,6 @@ bool Model::ready_products(std::string& err) {
         }
         prefill::mmq::load(l->type, l->rows);
     }
-    if (g.moe_experts > 0 && moe.grouped) {   // the routed experts' NVFP4 matrices: gate and up as one, and down
-        prefill::mmq::load(kTypeNvfp4Blocks, 2 * g.moe_ff);
-        prefill::mmq::load(kTypeNvfp4Blocks, g.n_embd);
-    }
     return true;
 }
 
@@ -652,10 +649,9 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         const size_t R = kMoeTile, E = (size_t) g.moe_experts, K = (size_t) g.moe_used, H = (size_t) g.n_embd;
         const size_t F = (size_t) g.moe_ff, P = R * K;
         const size_t floats = R * (E + 1) + P + P * F + P * H + P * 2 * F;
-        const bool grouped = prefill::mmq::built() && prefill::mmq::supported(kTypeNvfp4Blocks) &&
-                             prefill::mmq::fits(kTypeNvfp4Blocks, 2 * (int64_t) F) && prefill::mmq::fits(kTypeNvfp4Blocks, (int64_t) H);
-        const size_t mx = grouped ? std::max(prefill::mmq::q8_bytes((int64_t) P, (int64_t) H), prefill::mmq::q8_bytes((int64_t) P, (int64_t) F)) : 0;
-        if (!m->moe_arena.reserve(floats * 4 + 5 * P * 4 + (E + 1) * 4 + R * H + R * H / 4 + mx + 16 * 256)) {
+        const size_t a4x = prefill::fp4::token_bytes((int64_t) R, 2 * (int64_t) H), a4h = prefill::fp4::a4_bytes((int64_t) P, 2 * (int64_t) F, (int) E);
+        const size_t gsx = R, gsh = prefill::fp4::scale_count((int64_t) P, (int) E);
+        if (!m->moe_arena.reserve(floats * 4 + 4 * P * 4 + 2 * (E + 1) * 4 + R * H + R * H / 4 + a4x + a4h + (gsx + gsh) * 4 + 16 * 256)) {
             err = o.arch + ": out of device memory for the routed experts' scratch";
             return nullptr;
         }
@@ -667,18 +663,17 @@ ModelPtr make_model(const Geometry& g, const Weights& w, const Options& o, std::
         ms.wgt = m->moe_arena.take<float>(R * K);
         ms.h = m->moe_arena.take<float>(P * F);
         ms.y = m->moe_arena.take<float>(P * H);
-        ms.grouped = grouped;
-        if (grouped) {
-            ms.gu = m->moe_arena.take<float>(P * 2 * F);
-            ms.mx = m->moe_arena.take_bytes(mx);
-            ms.bounds = m->moe_arena.take<int32_t>(E + 1);
-            ms.tok = m->moe_arena.take<int32_t>(P);
-            ms.dst = m->moe_arena.take<int32_t>(P);
-            ms.exp = m->moe_arena.take<int32_t>(P);
-            ms.ident = m->moe_arena.take<int32_t>(P);
-            prefill::mmq::iota(ms.ident, (int64_t) P, nullptr);
-            cudaDeviceSynchronize();
-        }
+        ms.gu = m->moe_arena.take<float>(P * 2 * F);
+        ms.a4x = m->moe_arena.take_bytes(a4x);
+        ms.a4h = m->moe_arena.take_bytes(a4h);
+        ms.gsx = m->moe_arena.take<float>(gsx);
+        ms.gsh = m->moe_arena.take<float>(gsh);
+        ms.bounds = m->moe_arena.take<int32_t>(E + 1);
+        ms.tile_off = m->moe_arena.take<int32_t>(E + 1);
+        ms.blk_off = m->moe_arena.take<int32_t>(E + 1);
+        ms.tok = m->moe_arena.take<int32_t>(P);
+        ms.dst = m->moe_arena.take<int32_t>(P);
+        ms.exp = m->moe_arena.take<int32_t>(P);
     }
     if (!m->dec_arena.reserve(window_bytes(g, o.drafter == Drafter::Block ? w.dflash : BlockDrafter{}, o.max_context))) {
         err = o.arch + ": out of device memory for the decode scratch";

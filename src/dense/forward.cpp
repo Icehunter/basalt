@@ -6,6 +6,7 @@
 #include "basalt/kernels/iq_kernels.hpp"
 #include "basalt/kernels/logprobs.hpp"
 #include "basalt/kernels/moe_ffn.hpp"
+#include "basalt/prefill/moe_fp4.hpp"
 #include "basalt/kernels/native_mmvq.hpp"
 #include "basalt/kernels/nvfp4_planes.hpp"
 #include "basalt/kernels/pdl.hpp"
@@ -321,47 +322,54 @@ void moe_apply(Model& m, const Layer& L, uint16_t* resid, const float* xn, const
         if (n >= kMoeGrouped) kernels::bf16_rows_dot(x, L.router, ms.logits, n, ld, H, s);   // a chunk: the tensor-core projection
         else kernels::moe::router(x, L.router, n, H, ld, ms.logits, ld, s);
         kernels::moe::top_k(ms.logits, ld, n, E, K, ms.idx, ms.wgt, s);
-        if (ms.grouped && n >= kMoeGrouped) {   // a chunk: the pairs by expert through two MMQ products
+        if (n >= kMoeGrouped) {   // a chunk: the pairs by expert through two FP4 block-scaled products
+            namespace fp4 = prefill::fp4;
             const int pairs = n * K;
             kernels::moe::group(ms.idx, n, K, E, ms.bounds, ms.tok, ms.dst, ms.exp, s);
-            mmq::quantize(x, ms.tok, ms.mx, kTypeNvfp4Blocks, H, H, pairs, s);
-            mmq::Product p;
-            p.w = L.experts;
-            p.type = kTypeNvfp4Blocks;
+            fp4::plan_blocks(ms.bounds, E, ms.tile_off, ms.blk_off, s);
+            fp4::quantize_tokens(x, n, H, H, ms.a4x, ms.gsx, s, true);
+            fp4::Product p;
+            p.base = L.experts;
+            p.stride = ex.blob;
+            p.blk_off = ms.blk_off;
+            p.blocks = fp4::max_blocks(pairs, E);
+            p.n = E;
             p.w_rows = 2 * F;
             p.w_cols = H;
-            p.expert_bytes = ex.blob;
-            p.n = E;
-            p.xq = ms.mx;
+            p.a4 = ms.a4x;
+            p.gs = ms.gsx;
             p.bounds = ms.bounds;
-            p.ids = ms.ident;
-            p.total_rows = pairs;
-            p.max_rows = n;
-            p.opt_rows = (pairs + E - 1) / E;
-            p.dst = ms.gu;
-            p.ld_dst = 2 * F;
-            m.mmq->run(p, s);
-            // each NVFP4 blob ends in its {s_gate, s_up, s_down, 0}: the SwiGLU applies them (s_down too, so the down
-            // product's rows carry it)
-            mmq::SwigluForm form;
-            form.row_expert = ms.exp;
-            form.tail_stride = ex.blob;
-            mmq::swiglu(ms.gu, ms.h, pairs, F, false, s, (const float*) (L.experts + kernels::moe::tail_offset(H, F)), nullptr, 0, form);
-            mmq::quantize(ms.h, nullptr, ms.mx, kTypeNvfp4Blocks, F, F, pairs, s);
-            mmq::Product d = p;
-            d.w = L.experts + 2 * (size_t) F * ((size_t) H / 64 * 36);
+            p.ids = ms.tok;
+            p.tokens = n;
+            p.swiglu = true;   // each NVFP4 blob ends in its {s_gate, s_up, s_down, 0}: the SwiGLU applies them
+            p.tail_off = kernels::moe::tail_offset(H, F);
+            uint16_t* h16 = reinterpret_cast<uint16_t*>(ms.gu);
+            p.dst_f16 = h16;
+            p.ld_dst = F;
+            p.two = true;
+            fp4::run(p, s);
+            fp4::quantize_f16(h16, ms.bounds, ms.tile_off, E, ms.a4h, ms.gsh, F, F, pairs, s);
+            fp4::Product d = p;
+            d.swiglu = false;
+            d.ids = nullptr;
+            d.w_off = 2 * (size_t) F * ((size_t) H / 64 * 36);
             d.w_rows = H;
             d.w_cols = F;
-            d.ids = ms.dst;
-            d.dst = ms.y;
+            d.a4 = ms.a4h;
+            d.gs = ms.gsh;
+            d.tile_off = ms.tile_off;
+            d.dst_f16 = reinterpret_cast<uint16_t*>(ms.y);   // the pairs' rows as FP16, half the traffic of the combine's reads
+            d.dst = nullptr;
+            d.dst_ids = ms.dst;
             d.ld_dst = H;
-            m.mmq->run(d, s);
+            fp4::run(d, s);
+            kernels::moe::combine_f16(resid + (size_t) t0 * H, d.dst_f16, ms.wgt, ms.logits + E, ld, shared + (size_t) t0 * H, n, K, H, s);
         } else {
             kernels::moe::quantize(x, n, H, ms.xq, ms.xs, s);
             kernels::moe::gate_up(ex, ms.xq, ms.xs, ms.idx, n, K, ms.h, s);
             kernels::moe::down(ex, ms.h, ms.idx, n, K, ms.y, s);
+            kernels::moe::combine(resid + (size_t) t0 * H, ms.y, ms.wgt, ms.logits + E, ld, shared + (size_t) t0 * H, n, K, H, s);
         }
-        kernels::moe::combine(resid + (size_t) t0 * H, ms.y, ms.wgt, ms.logits + E, ld, shared + (size_t) t0 * H, n, K, H, s);
     }
 }
 

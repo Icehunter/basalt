@@ -87,13 +87,16 @@ struct WindowScratch {
 
 /// A routed-expert layer's scratch for up to kMoeTile rows at a time.
 constexpr int kMoeTile = 4096;   // one prompt chunk: about 128 rows an expert, so the grouped products take a wide tile
-constexpr int kMoeGrouped = 64;               // rows from which a chunk's experts run as grouped MMQ products
+constexpr int kMoeGrouped = 64;               // rows from which a chunk's experts run as grouped FP4 products
 constexpr int kTypeNvfp4Blocks = 40;          // ggml NVFP4: 64 values in 36 bytes (the routed experts' matrices)
 struct MoeScratch {
-    bool grouped = false;        // the experts' NVFP4 matrices have MMQ tiles
-    float* gu = nullptr;         // [tile * used][2 ff]: the grouped gate and up products (rows in expert order)
-    void* mx = nullptr;          // MMQ's activation rows
-    int32_t *bounds = nullptr, *tok = nullptr, *dst = nullptr, *exp = nullptr, *ident = nullptr;   // the pairs by expert
+    float* gu = nullptr;         // [tile * used][2 ff]: the grouped products' FP16 SwiGLU rows (in expert order)
+    void* a4x = nullptr;         // the chunk's rows as FP4 token planes, and their token scales
+    float* gsx = nullptr;
+    void* a4h = nullptr;         // the SwiGLU rows as FP4 planes by expert tile, and their scales
+    float* gsh = nullptr;
+    int32_t *tile_off = nullptr, *blk_off = nullptr;   // [experts + 1] each: the tiles and GEMM blocks by expert
+    int32_t *bounds = nullptr, *tok = nullptr, *dst = nullptr, *exp = nullptr;   // the pairs by expert
     float* logits = nullptr;     // [tile][experts + 1]: the router's outputs, then the shared expert's gate
     int8_t* xq = nullptr;        // [tile][hidden]: the normed rows rounded to INT8 for the experts
     float* xs = nullptr;         // [tile][hidden / 16]: their scales
