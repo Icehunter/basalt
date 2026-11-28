@@ -42,13 +42,6 @@ int main(int argc, char** argv) {
         f.read((char*) host.data(), (std::streamsize) layer);
         if (!f) { std::printf("short read of the experts\n"); return 1; }
     }
-    for (int e : {0, 62})
-        for (int r : {0, 1, 2, 3}) {
-            const uint8_t* row = host.data() + (size_t) e * blob + (size_t) r * 1152;
-            int nz = 0;
-            for (int i = 0; i < 1152; ++i) nz += row[i] != 0;
-            std::printf("host expert %2d row %d: %4d of 1152 bytes nonzero, first bytes %02x %02x %02x %02x %02x %02x %02x %02x\n", e, r, nz, row[0], row[1], row[2], row[3], row[4], row[5], row[6], row[7]);
-        }
     uint8_t* dev = nullptr;
     CK(cudaMalloc(&dev, layer));
     CK(cudaMemcpy(dev, host.data(), layer, cudaMemcpyHostToDevice));
@@ -120,37 +113,7 @@ int main(int argc, char** argv) {
     form.row_expert = dexp;
     form.tail_stride = blob;
     mmq::swiglu(dgu, dh, P, F, false, nullptr, (const float*) (dev + moe::tail_offset(H, F)), nullptr, 0, form);
-    {   // the raw gate product (before the tail scales) against a host decode of the blob
-        CK(cudaDeviceSynchronize());
-        std::vector<float> gu((size_t) P * 2 * F);
-        std::vector<int32_t> tok(P), exv(P);
-        CK(cudaMemcpy(gu.data(), dgu, gu.size() * 4, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(tok.data(), dtok, (size_t) P * 4, cudaMemcpyDeviceToHost));
-        CK(cudaMemcpy(exv.data(), dexp, (size_t) P * 4, cudaMemcpyDeviceToHost));
-        auto ue = [](unsigned c) { const unsigned e = c >> 3, m = c & 7; return e == 0 ? m / 512.0 : (8 + m) * std::ldexp(1.0, (int) e - 10); };
-        static const double e2[16] = {0, .5, 1, 1.5, 2, 3, 4, 6, -0., -.5, -1, -1.5, -2, -3, -4, -6};
-        for (int i : {0, 500}) {
-            const int e = exv[(size_t) i], t = tok[(size_t) i];
-            const uint8_t* b = host.data() + (size_t) e * blob;
-            for (int r : {0, 1, 2, 3, 100, 511, 512, 513}) {   // gate rows, then up rows
-                const uint8_t* row = b + (size_t) r * (H / 64) * 36;
-                double ref = 0;
-                for (int v = 0; v < H; ++v) {
-                    const uint8_t* blk = row + (size_t) (v / 64) * 36;
-                    const int sub = (v % 64) / 16, j = v % 16;
-                    const uint8_t byte = blk[4 + 8 * sub + (j % 8)];
-                    ref += e2[j < 8 ? byte & 15 : byte >> 4] * ue(blk[sub]) * x[(size_t) t * H + v];
-                }
-                std::printf("entry %4d expert %3d token %4d row %3d: mmq %12.5f   host %12.5f\n", i, e, t, r, gu[(size_t) i * 2 * F + r], ref);
-            }
-        }
-    }
-    // h in expert order -> compare against the per-pair h by pair index first
-    std::vector<float> h_new((size_t) P * F), h_old((size_t) P * F);
-    std::vector<int32_t> dst(P);
     CK(cudaDeviceSynchronize());
-    CK(cudaMemcpy(h_new.data(), dh, h_new.size() * 4, cudaMemcpyDeviceToHost));
-    CK(cudaMemcpy(dst.data(), ddst, (size_t) P * 4, cudaMemcpyDeviceToHost));
     mmq::quantize(dh, nullptr, dmx, kType, F, F, P, nullptr);
     mmq::Product d = p;
     d.w = dev + 2 * (size_t) F * ((size_t) H / 64 * 36);
@@ -161,19 +124,6 @@ int main(int argc, char** argv) {
     d.ld_dst = H;
     ctx.run(d, nullptr);
     CK(cudaDeviceSynchronize());
-
-    // h of the per-pair path (recomputed: dh was overwritten)
-    moe::gate_up(ex, dxq, dxs, didx, N, K, dh, nullptr);
-    CK(cudaDeviceSynchronize());
-    CK(cudaMemcpy(h_old.data(), dh, h_old.size() * 4, cudaMemcpyDeviceToHost));
-    double hn = 0, hd = 0;
-    for (int i = 0; i < P; ++i)
-        for (int r = 0; r < F; ++r) {
-            const double a = h_old[(size_t) dst[i] * F + r], b = h_new[(size_t) i * F + r];
-            hn += (a - b) * (a - b);
-            hd += a * a;
-        }
-    std::printf("h   : relative RMS difference per-pair vs grouped = %.5f\n", std::sqrt(hn / hd));
 
     std::vector<float> y_old((size_t) P * H), y_new((size_t) P * H);
     CK(cudaMemcpy(y_old.data(), dy_old, y_old.size() * 4, cudaMemcpyDeviceToHost));
