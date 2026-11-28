@@ -7,6 +7,7 @@ Each model has one page for what it computes in and what each rounding costs. Th
 - [DeepSeek-V4.1-Flash](deepseek41.md): stages, the prompt path, verify windows, quality against its BF16 reference and the lossy
   routing flags.
 - [Qwen3.8-27B](qwen38-27b.md): the dense stack's roundings and quality against its BF16 reference.
+- [Qwen3.8-35B-A3B](qwen35moe.md): the experts' roundings in decode and in prompt chunks, and quality against its BF16 reference.
 - [Hy4-flash](hy4-flash.md): weights, stages, the attention caches, drafting, quality against its BF16 reference and the lossy
   routing flags.
 - [Inkling 2 Mini](inkling2.md): weights, stages, the attention caches and quality against its reference (the release with
