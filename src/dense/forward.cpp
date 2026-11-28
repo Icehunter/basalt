@@ -684,7 +684,7 @@ void commit_window(Model& m, SessionState& st, int n, cudaStream_t s) {
     a.h_v = g.gdn_v_heads;
     a.n_layers = m.n_gdn;
     a.n_keep = st.n_keep;
-    kernels::gdn_commit_layers(a, s, 64, n);
+    kernels::gdn_commit_layers(a, s, 128, n);
 }
 
 namespace {
@@ -834,36 +834,55 @@ namespace {
 
 int32_t* batch_pos0(Model& m) { return reinterpret_cast<int32_t*>(reinterpret_cast<char*>(m.ws.btab) + offsetof(BatchTable, pos0)); }
 
-void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, int rows, cudaStream_t s) {
+// One attention layer's cache of a segment: its rows' cells and where they sit
+struct AttnSeg {
+    uint16_t* kc = nullptr;
+    uint16_t* vc = nullptr;
+    int T = 0;
+    int64_t pos = 0;
+    kernels::KvInt8 q8;
+    kernels::KvFar far_kv;
+};
+
+// The rows of S segments (m.ws.x, `rows` in all) through an attention layer: each segment's queries and cache cells, then
+// every segment's attention in one launch
+void segs_attn(Model& m, const Layer& L, const AttnSeg* segs, int S, int rows, cudaStream_t s) {
     const Geometry& g = m.g;
     WindowScratch& b = m.ws;
     const int H = g.n_embd, AQ = g.n_head * g.head_dim, KV = g.n_kv * g.head_dim;
     const void* xq = wnorm(m, b.x, L.attn_norm, b.xn, L.q.type, H, rows, g.eps, s);
     prod_group(m, b.xn, xq, L.q.type, {{&L.q, b.qfull}, {&L.k, b.k}, {&L.v, b.v}}, rows, s);
-    // each segment's queries and cache cells, then every segment's attention in one launch
     int row = 0;
     kernels::GqaSeg as[kBatch];
     for (int k = 0; k < S; ++k) {
-        SessionState& st = *segs[k].st;
         const int T = segs[k].T;
         const int32_t* p0 = batch_pos0(m) + k;
         kernels::attn_qk_prepare(b.qfull + (size_t) row * 2 * AQ, b.k + (size_t) row * KV, b.v + (size_t) row * KV, L.q_norm,
                                  L.k_norm, g.eps, g.rope, b.pos + (size_t) row * 3, T, g.n_head, g.n_kv,
-                                 b.qo + (size_t) row * AQ, st.kc[(size_t) ai], st.vc[(size_t) ai], segs[k].pos, s, 256, true, 0, p0,
-                                 st.kq[(size_t) ai], st.far_kv[(size_t) ai]);
+                                 b.qo + (size_t) row * AQ, segs[k].kc, segs[k].vc, segs[k].pos, s, 256, true, 0, p0, segs[k].q8,
+                                 segs[k].far_kv);
         as[k].T = T;
-        as[k].k_cache = st.kc[(size_t) ai];
-        as[k].v_cache = st.vc[(size_t) ai];
+        as[k].k_cache = segs[k].kc;
+        as[k].v_cache = segs[k].vc;
         as[k].pos0 = segs[k].pos;
         as[k].pos_dev = p0;
-        as[k].q8 = st.kq[(size_t) ai];
-        as[k].far_kv = st.far_kv[(size_t) ai];
+        as[k].q8 = segs[k].q8;
+        as[k].far_kv = segs[k].far_kv;
         row += T;
     }
     const bool gated = on_wg(L.o.type);
     kernels::gqa_decode_attn_segs(b.qo, g.n_head, g.n_kv, as, S, b.attn, m.o.max_context, gated ? nullptr : b.ao, s,
                                   gated ? b.qfull : nullptr, gated ? (uint16_t*) b.xq : nullptr);
     win_attn_out(m, L, rows, s);
+}
+
+void batch_attn(Model& m, const Layer& L, int ai, const BatchSeg* segs, int S, int rows, cudaStream_t s) {
+    AttnSeg as[kBatch];
+    for (int k = 0; k < S; ++k) {
+        SessionState& st = *segs[k].st;
+        as[k] = {st.kc[(size_t) ai], st.vc[(size_t) ai], segs[k].T, segs[k].pos, st.kq[(size_t) ai], st.far_kv[(size_t) ai]};
+    }
+    segs_attn(m, L, as, S, rows, s);
 }
 
 void batch_gdn(Model& m, const Layer& L, int gi, const BatchSeg* segs, int S, int rows, int max_n, cudaStream_t s) {
@@ -1348,6 +1367,130 @@ bool mtp_step(Model& m, SessionState& st, int k, const float* hid, const int32_t
     }
     cudaGraphDestroy(graph);
     return cuda_ok("drafter", err);
+}
+
+namespace {
+// The batched drafter step's kernels for S sessions' rows, from device inputs only (the uploads in mtp_step_batch)
+void mtp_batch_body(Model& m, SessionState* const* sts, const float* const* hid, const int32_t* const* tok, const int64_t* c0,
+                    int S, float* const* out, float* const* lp_row, cudaStream_t s) {
+    const Geometry& g = m.g;
+    const Mtp& d = m.wd.mtp;
+    WindowScratch& b = m.ws;
+    const int H = g.n_embd;
+    for (int i = 0; i < S; ++i) kernels::iq_embed_rows(30, m.w.embd, (size_t) H * 2, tok[i], 1, H, b.tmp + (size_t) i * H, s);
+    kernels::rms_norm_rows(b.tmp, m.w.mtp.norm_e, b.cat, S, H, g.eps, s, 2 * H);
+    for (int i = 0; i < S; ++i) kernels::rms_norm_rows(hid[i], m.w.mtp.norm_h, b.cat + (size_t) i * 2 * H + H, 1, H, g.eps, s, 2 * H);
+    prod(m, d.fc, wact(m, b.cat, d.fc.type, 2 * H, S, s), b.tmp, S, s);
+    kernels::to_bf16(b.tmp, b.x, (int64_t) S * H, s);
+    AttnSeg as[kBatch];
+    for (int i = 0; i < S; ++i) as[i] = {sts[i]->mtp_kc, sts[i]->mtp_vc, 1, c0[i], {}, {}};
+    segs_attn(m, d.layer, as, S, S, s);
+    win_ffn(m, d.layer, S, s);
+    const int64_t nv = mtp_vocab(m);
+    Linear head = m.w.head;
+    head.rows = nv;
+    prod(m, head, wnorm(m, b.x, d.norm, b.xn, head.type, H, S, g.eps, s), b.hl, S, s);
+    for (int i = 0; i < S; ++i) {
+        cudaMemcpyAsync(out[i], b.xn + (size_t) i * H, (size_t) H * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        cudaMemcpyAsync(sts[i]->dlogits, b.hl + (size_t) i * nv, (size_t) nv * sizeof(float), cudaMemcpyDeviceToDevice, s);
+        kernels::row_logprobs(sts[i]->dlogits, 1, g.n_vocab, tok[i], 1, lp_row[i], b.lp_scratch, s);
+    }
+}
+}  // namespace
+
+bool mtp_step_batch(Model& m, SessionState* const* sts, const float* const* hid, const int32_t* const* tok, const int64_t* c0,
+                    int S, float* const* out, float* const* lp_row, std::string& err, cudaStream_t s) {
+    WindowScratch& b = m.ws;
+    // the rows' positions, the cells' first positions and the one segment
+    std::vector<int32_t> p3, first((size_t) S);
+    p3.reserve((size_t) S * 3);
+    for (int i = 0; i < S; ++i) {
+        std::vector<int32_t> r;
+        text_positions(r, 1, c0[i], sts[i]->rope_delta);
+        p3.insert(p3.end(), r.begin(), r.end());
+        first[(size_t) i] = (int32_t) c0[i];
+    }
+    const int32_t bounds[2] = {0, S};
+    cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(batch_pos0(m), first.data(), (size_t) S * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(b.pos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    // the step is one graph per set of sessions and step (every pointer it reads or writes is the session's own)
+    model::GraphLru<core::CapturedGraph>::Key key;
+    for (int i = 0; i < S; ++i)
+        key.insert(key.end(), {(uint64_t) (uintptr_t) sts[i], (uint64_t) (uintptr_t) hid[i], (uint64_t) (uintptr_t) tok[i],
+                               (uint64_t) (uintptr_t) out[i], (uint64_t) (uintptr_t) lp_row[i]});
+    if (core::CapturedGraph* g = m.mtp_graphs.find(key)) {
+        if (!g->launch(s, err)) return false;
+        return cuda_ok("drafter batch", err);
+    }
+    // the first run goes as launched (kernels load lazily), then the step is captured for the next ones
+    mtp_batch_body(m, sts, hid, tok, c0, S, out, lp_row, s);
+    if (!cuda_ok("drafter batch", err)) return false;
+    core::CapturedGraph g;
+    if (!g.begin(s, err)) return false;
+    mtp_batch_body(m, sts, hid, tok, c0, S, out, lp_row, s);
+    if (!g.end(s, err)) return false;
+    m.mtp_graphs.insert(std::move(key), std::move(g));
+    return cuda_ok("drafter batch", err);
+}
+
+namespace {
+// The drafter's history for S segments (KV only): segment i's n rows pair hid[i] rows with tok[i] tokens at cells c0[i] ..
+void mtp_hist_body(Model& m, const MtpHist* segs, int S, int R, cudaStream_t s) {
+    const Geometry& g = m.g;
+    const Mtp& d = m.wd.mtp;
+    WindowScratch& b = m.ws;
+    const int H = g.n_embd;
+    int row = 0;
+    for (int i = 0; i < S; ++i) {
+        kernels::iq_embed_rows(30, m.w.embd, (size_t) H * 2, segs[i].tok, segs[i].n, H, b.tmp + (size_t) row * H, s);
+        row += segs[i].n;
+    }
+    kernels::rms_norm_rows(b.tmp, m.w.mtp.norm_e, b.cat, R, H, g.eps, s, 2 * H);
+    row = 0;
+    for (int i = 0; i < S; ++i) {
+        kernels::rms_norm_rows(segs[i].hid, m.w.mtp.norm_h, b.cat + (size_t) row * 2 * H + H, segs[i].n, H, g.eps, s, 2 * H);
+        row += segs[i].n;
+    }
+    prod(m, d.fc, wact(m, b.cat, d.fc.type, 2 * H, R, s), b.tmp, R, s);
+    kernels::to_bf16(b.tmp, b.x, (int64_t) R * H, s);
+    AttnSeg as[kBatch];
+    for (int i = 0; i < S; ++i) as[i] = {segs[i].st->mtp_kc, segs[i].st->mtp_vc, segs[i].n, segs[i].c0, {}, {}};
+    segs_attn(m, d.layer, as, S, R, s);
+}
+}  // namespace
+
+bool mtp_hist_batch(Model& m, const MtpHist* segs, int S, std::string& err, cudaStream_t s) {
+    WindowScratch& b = m.ws;
+    int R = 0;
+    std::vector<int32_t> p3, first((size_t) S);
+    for (int i = 0; i < S; ++i) {
+        std::vector<int32_t> r;
+        text_positions(r, segs[i].n, segs[i].c0, segs[i].st->rope_delta);
+        p3.insert(p3.end(), r.begin(), r.end());
+        first[(size_t) i] = (int32_t) segs[i].c0;
+        R += segs[i].n;
+    }
+    const int32_t bounds[2] = {0, R};
+    cudaMemcpyAsync(b.bounds, bounds, sizeof bounds, cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(batch_pos0(m), first.data(), (size_t) S * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    cudaMemcpyAsync(b.pos, p3.data(), p3.size() * sizeof(int32_t), cudaMemcpyHostToDevice, s);
+    model::GraphLru<core::CapturedGraph>::Key key{1};
+    for (int i = 0; i < S; ++i)
+        key.insert(key.end(), {(uint64_t) (uintptr_t) segs[i].st, (uint64_t) (uintptr_t) segs[i].hid, (uint64_t) (uintptr_t) segs[i].tok,
+                               (uint64_t) segs[i].n});
+    if (core::CapturedGraph* g = m.mtp_graphs.find(key)) {
+        if (!g->launch(s, err)) return false;
+        return cuda_ok("drafter history batch", err);
+    }
+    mtp_hist_body(m, segs, S, R, s);
+    if (!cuda_ok("drafter history batch", err)) return false;
+    core::CapturedGraph g;
+    if (!g.begin(s, err)) return false;
+    mtp_hist_body(m, segs, S, R, s);
+    if (!g.end(s, err)) return false;
+    m.mtp_graphs.insert(std::move(key), std::move(g));
+    return cuda_ok("drafter history batch", err);
 }
 
 }  // namespace basalt::dense

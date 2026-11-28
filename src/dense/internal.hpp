@@ -165,6 +165,7 @@ public:
     // the batch windows' graphs, one per composition (model/batch_driver.hpp captures them on one card; a layer split's
     // forward_batch keeps each card's here itself)
     model::BatchShared batch;
+    model::GraphLru<core::CapturedGraph> mtp_graphs{64};   // the batched drafter steps' graphs, by sessions and step
     // a batch window's GDN gates run on gate_side beside the qkv/z product, from gate_fork to gate_join
     cudaStream_t gate_side = nullptr;
     cudaEvent_t gate_fork = nullptr, gate_join = nullptr;
@@ -338,6 +339,21 @@ bool mtp_window(Model& m, SessionState& st, const float* hid, const int32_t* tok
 /// run, whose positions come from the device like a decode window's.
 bool mtp_step(Model& m, SessionState& st, int k, const float* hid, const int32_t* tok, int64_t c0, float* out, float* lp_row,
               std::string& err, cudaStream_t stream = nullptr);
+/// Step of the drafter's chain for S sessions (S <= kBatch) as one pass of S rows: session i's row pairs hid[i] with the
+/// token tok[i] at cell c0[i], and writes its output row out[i] and its pick and probability lp_row[i] like mtp_step.
+bool mtp_step_batch(Model& m, SessionState* const* sts, const float* const* hid, const int32_t* const* tok, const int64_t* c0,
+                    int S, float* const* out, float* const* lp_row, std::string& err, cudaStream_t stream);
+/// One session's part of the drafter's history after a window: `n` rows pair the hidden rows `hid` with the device tokens
+/// `tok` at cells c0 ...
+struct MtpHist {
+    SessionState* st = nullptr;
+    const float* hid = nullptr;
+    const int32_t* tok = nullptr;
+    int n = 0;
+    int64_t c0 = 0;
+};
+/// The histories of S segments (the sum of their rows at most kBatch) as one pass, KV only.
+bool mtp_hist_batch(Model& m, const MtpHist* segs, int S, std::string& err, cudaStream_t stream);
 /// The drafter's history over a prompt chunk's pairs (n <= kChunk), KV only: hidden rows `hid`, next tokens `tok`
 /// (device ids) or next rows `emb` (device [n][n_embd]).
 bool mtp_chunk(Model& m, SessionState& st, const float* hid, const int32_t* tok, const float* emb, int n, int64_t c0,
