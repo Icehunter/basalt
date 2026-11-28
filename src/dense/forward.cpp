@@ -684,7 +684,7 @@ void commit_window(Model& m, SessionState& st, int n, cudaStream_t s) {
     a.h_v = g.gdn_v_heads;
     a.n_layers = m.n_gdn;
     a.n_keep = st.n_keep;
-    kernels::gdn_commit_layers(a, s, 64, n);
+    kernels::gdn_commit_layers(a, s, 128, n);
 }
 
 namespace {
