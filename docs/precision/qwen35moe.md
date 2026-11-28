@@ -44,7 +44,7 @@ run it, so the gate's scores include it.
 Rounding to one FP4 term instead of two is not used: it is no faster here and it loses quality (mean KLD 0.01404 and top-1 94.36%,
 against 0.01303 and 94.63% with two terms, int8 KV).
 
-The gate reads 256 tokens of each chunk as a prompt. Quality against BF16 after a long prompt is not measured.
+The gate reads 256 tokens of each chunk as a prompt. Long prompts are scored in the next section.
 
 ## Quality
 
@@ -65,4 +65,24 @@ Reproduce, with `qwen35moe-bf16.kld` from the pack's Hugging Face repository:
 
 ```sh
 basalt-bench --model PACK.basalt --quality 100 --kld-base qwen35moe-bf16.kld -- --kv int8
+```
+
+## Long prompts
+
+The same text in 6 chunks of 16,384 tokens: the first 8,192 are read as one prompt and the next 8,192 are scored. BF16
+perplexity over the scored half is 4.8245. `basalt-bench --quality 6`, T 1:
+
+| KV cache | PPL | Mean KLD | Median KLD | p99 KLD | Top-1 |
+| --- | --- | --- | --- | --- | --- |
+| int8 | 4.8644 | 0.01220 | 0.00542 | 0.1196 | 95.10% |
+| nvfp4 | 4.8805 | 0.01559 | 0.00721 | 0.1463 | 94.48% |
+
+These are close to the 512-token rows above.
+
+The reference needs 16,384 tokens of context, 24 GB of disk, and the BF16 GGUF with some of its experts on the CPU on a 32 GB card:
+
+```sh
+llama-perplexity -m Qwen3.8-35B-A3B-BF16.gguf -f wiki.test.raw -c 16384 -b 16384 -ub 2048 -ngl 99 -ncmoe 24 -fa on \
+  --chunks 6 --kl-divergence-base qwen35moe-bf16-c16k.kld
+basalt-bench --model PACK.basalt --quality 6 --kld-base qwen35moe-bf16-c16k.kld -- --kv int8 --max-context 16640
 ```
